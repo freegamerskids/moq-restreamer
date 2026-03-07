@@ -1,20 +1,18 @@
 import * as Catalog from "@moq/hang/catalog";
 import * as Moq from "@moq/lite";
 
+import { AVC_CODEC_STRING } from "./init-segment.js";
 import type { RunnerConfig } from "./types.js";
 
 /**
  * Serve catalog.json using @moq/hang catalog spec so clients can discover tracks.
- * Includes AVC description (avcC) for video so WebCodecs VideoDecoder can configure before first frame.
+ * Video tracks use H.264 with SPS/PPS inlined before each keyframe (no description in catalog).
  */
 export function serveCatalog(
 	track: Moq.Track,
 	configMap: Map<string, RunnerConfig>,
 ): void {
-	const videoRenditions: Record<
-		string,
-		{ codec: string; container: { kind: "legacy" }; description?: string }
-	> = {};
+	const videoRenditions: Record<string, { codec: string; container: { kind: "legacy" } }> = {};
 	const audioRenditions: Record<
 		string,
 		{ codec: string; container: { kind: "legacy" }; sampleRate: number; numberOfChannels: number }
@@ -23,13 +21,12 @@ export function serveCatalog(
 	for (const [trackName, config] of configMap.entries()) {
 		if (trackName.startsWith("video/")) {
 			videoRenditions[trackName] = {
-				codec: "avc1.42E01E",
+				codec: config.codec ?? AVC_CODEC_STRING,
 				container: legacyContainer,
-				...(config.codecDescription && { description: config.codecDescription }),
 			};
 		} else if (trackName.startsWith("audio/")) {
 			audioRenditions[trackName] = {
-				codec: "opus",
+				codec: config.codec ?? "opus",
 				container: legacyContainer,
 				sampleRate: 48000,
 				numberOfChannels: 2,

@@ -1,9 +1,9 @@
 import { setTimeout as sleep } from "node:timers/promises";
 
-import { seenUrlLimit } from "./config.js";
+import { maxSegmentsPerPoll, seenUrlLimit } from "./config.js";
 import { decryptIfNeeded } from "./cenc.js";
 import { fetchBytes, fetchText } from "./fetch.js";
-import { parseAvcCFromInitSegment } from "./init-segment.js";
+import { AVC_CODEC_STRING, getDefaultAvcCDescription } from "./init-segment.js";
 import type {
 	DashSegmentTemplate,
 	DashTrackDescriptor,
@@ -167,7 +167,8 @@ export function parseDashManifest(
 }
 
 export async function buildDashRunnerConfigs(context: RunnerContext): Promise<RunnerConfig[]> {
-	const raw = await fetchText(context.stream.url);
+	const fetchOpts = { headers: context.stream.headers };
+	const raw = await fetchText(context.stream.url, fetchOpts);
 	const descriptors = parseDashManifest(raw, new URL(context.stream.url), context.stream.name);
 	const configs: RunnerConfig[] = [];
 
@@ -178,42 +179,21 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 			nextNumber: desc.template.startNumber,
 		};
 
-		let codecDescription: string | undefined;
-		if (desc.kind === "video") {
-			try {
-				let initUrl: string | undefined;
-				if (desc.template.initialization) {
-					initUrl = new URL(
-						renderTemplateUrl(desc.template.initialization, {
-							RepresentationID: desc.representationId,
-							Number: desc.template.startNumber,
-						}),
-						desc.manifestBase,
-					).toString();
-				} else if (desc.mode === "list" && desc.segmentUrls.length > 0) {
-					initUrl = desc.segmentUrls[0];
-				}
-				if (initUrl) {
-					const bytes = await fetchBytes(initUrl);
-					const rawInit = context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes;
-					codecDescription = parseAvcCFromInitSegment(rawInit);
-				}
-			} catch {
-				// optional
-			}
-		}
-
 		const pollMs = 1000;
 		if (desc.mode === "template") {
 			configs.push({
 				streamName: context.stream.name,
 				name: desc.trackName,
+				kind: desc.kind,
 				cenc: context.cenc,
 				pollMs,
-				codecDescription,
+				...(desc.kind === "video" && {
+					codec: AVC_CODEC_STRING,
+					codecDescription: getDefaultAvcCDescription(),
+				}),
 				nextSegments: async () => {
 					const chunks: Uint8Array[] = [];
-					const currentText = await fetchText(desc.manifestUrl);
+					const currentText = await fetchText(desc.manifestUrl, fetchOpts);
 					const latest = parseDashManifest(
 						currentText,
 						new URL(desc.manifestUrl),
@@ -237,9 +217,11 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 						const initResolved = new URL(initUrl, activeBase).toString();
 						if (!state.seen.has(initResolved)) {
 							try {
-								const bytes = await fetchBytes(initResolved);
+								const bytes = await fetchBytes(initResolved, fetchOpts);
 								chunks.push(
-									context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes,
+									context.cenc && desc.kind === "audio"
+										? await decryptIfNeeded(bytes, context.cenc)
+										: bytes,
 								);
 								state.seen.add(initResolved);
 							} catch {
@@ -261,9 +243,11 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 						attempts += 1;
 						if (!state.seen.has(segmentUrl)) {
 							try {
-								const bytes = await fetchBytes(segmentUrl);
+								const bytes = await fetchBytes(segmentUrl, fetchOpts);
 								chunks.push(
-									context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes,
+									context.cenc && desc.kind === "audio"
+										? await decryptIfNeeded(bytes, context.cenc)
+										: bytes,
 								);
 								state.seen.add(segmentUrl);
 								break;
@@ -286,11 +270,15 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 		configs.push({
 			streamName: context.stream.name,
 			name: desc.trackName,
+			kind: desc.kind,
 			cenc: context.cenc,
 			pollMs,
-			codecDescription,
+			...(desc.kind === "video" && {
+				codec: AVC_CODEC_STRING,
+				codecDescription: getDefaultAvcCDescription(),
+			}),
 			nextSegments: async () => {
-				const currentText = await fetchText(desc.manifestUrl);
+				const currentText = await fetchText(desc.manifestUrl, fetchOpts);
 				const latest = parseDashManifest(
 					currentText,
 					new URL(context.stream.url),
@@ -299,15 +287,20 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 				const matching = latest.find((d) => d.id === desc.id);
 				const candidate = matching?.segmentUrls ?? desc.segmentUrls;
 				const chunkPayloads: Uint8Array[] = [];
+				let added = 0;
 
 				for (const candidateUrl of candidate) {
+					if (added >= maxSegmentsPerPoll) break;
 					if (state.seen.has(candidateUrl)) continue;
 					state.seen.add(candidateUrl);
 					try {
-						const bytes = await fetchBytes(candidateUrl);
+						const bytes = await fetchBytes(candidateUrl, fetchOpts);
 						chunkPayloads.push(
-							context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes,
+							context.cenc && desc.kind === "audio"
+								? await decryptIfNeeded(bytes, context.cenc)
+								: bytes,
 						);
+						added += 1;
 					} catch {
 						// Ignore per-segment failures
 					}

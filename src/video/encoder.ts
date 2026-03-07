@@ -11,10 +11,12 @@ import * as Moq from "@moq/lite";
 import type { Frame } from "node-av";
 import type { Packet } from "node-av";
 import { Encoder as NodeAVEncoder } from "node-av/api";
-import { FF_ENCODER_LIBX264 } from "node-av/constants";
+import { FF_ENCODER_LIBX264, FF_ENCODER_LIBX265 } from "node-av/constants";
 
 export interface EncoderConfig {
-	/** Video codec (e.g. 'avc1.42E01E'). Encoder uses libx264. */
+	/** Output codec: 'h264' (libx264) or 'hevc' (libx265). Default 'hevc'. */
+	outputCodec?: "h264" | "hevc";
+	/** Video codec string for catalog (e.g. 'avc1.42E01E', 'hev1.1.6.L93.B0'). */
 	codec?: string;
 	/** Width in pixels. */
 	width: number;
@@ -24,14 +26,14 @@ export interface EncoderConfig {
 	framerate?: number;
 	/** Target bitrate in bps. */
 	bitrate?: number | string;
-	/** Keyframe interval in milliseconds (default 2000). */
+	/** Keyframe interval in milliseconds (default 1000). */
 	keyframeInterval?: number;
 	/** Max bitrate for VBR. */
 	maxBitrate?: number;
 }
 
 const DEFAULT_FRAMERATE = 30;
-const DEFAULT_KEYFRAME_INTERVAL_MS = 2000;
+const DEFAULT_KEYFRAME_INTERVAL_MS = 1000;
 const DEFAULT_BITRATE = 2_500_000;
 
 /**
@@ -48,8 +50,9 @@ export class Encoder {
 		get(): Catalog.VideoConfig | undefined {
 			const c = this.encoder.#config;
 			if (!c) return undefined;
+			const codec = c.codec ?? (c.outputCodec === "h264" ? "avc1.42E01E" : "hev1.1.6.L93.B0");
 			return {
-				codec: c.codec ?? "avc1.42E01E",
+				codec,
 				container: { kind: "legacy" },
 				codedWidth: Catalog.u53(c.width),
 				codedHeight: Catalog.u53(c.height),
@@ -88,15 +91,21 @@ export class Encoder {
 				? this.#config.bitrate
 				: String(this.#config.bitrate ?? DEFAULT_BITRATE);
 
+		const useHevc = (this.#config.outputCodec ?? "hevc") === "hevc";
+		const encoderId = useHevc ? FF_ENCODER_LIBX265 : FF_ENCODER_LIBX264;
 		try {
-			this.#encoder = await NodeAVEncoder.create(FF_ENCODER_LIBX264, {
+			this.#encoder = await NodeAVEncoder.create(encoderId, {
 				bitrate,
 				gopSize,
 				...(this.#config.maxBitrate != null && { maxRate: this.#config.maxBitrate }),
-				options: {
-					preset: "veryfast",
-					tune: "zerolatency",
-				},
+				options: useHevc
+					? { preset: "veryfast", tune: "zerolatency" }
+					: {
+							preset: "veryfast",
+							tune: "zerolatency",
+							repeat_headers: 1,
+							level: "6.2",
+						},
 			});
 		} catch (err) {
 			producer.close(err instanceof Error ? err : new Error(String(err)));

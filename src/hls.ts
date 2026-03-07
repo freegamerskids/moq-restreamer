@@ -1,16 +1,20 @@
 import {
 	defaultPollMs,
 	hlsTargetMs,
+	maxSegmentsPerPoll,
 	seenUrlLimit,
 } from "./config.js";
 import { decryptIfNeeded } from "./cenc.js";
 import { fetchBytes, fetchText } from "./fetch.js";
-import { parseAvcCFromInitSegment } from "./init-segment.js";
+import { AVC_CODEC_STRING, getDefaultAvcCDescription } from "./init-segment.js";
 import type {
+	MuxedAudioTrackRef,
 	ParsedM3u8Media,
 	RunnerConfig,
 	RunnerContext,
+	SegmentUrlBatch,
 	M3u8Master,
+	StreamKind,
 } from "./types.js";
 import { createBoundedSeen, parseAttributeLine, sanitizePlaylistUri } from "./util.js";
 
@@ -95,9 +99,12 @@ export async function readPlaylistSegments(
 		initEmitted: boolean;
 	},
 	base: URL,
+	kind: StreamKind,
 ): Promise<Uint8Array[]> {
+	const fetchOpts = { headers: context.stream.headers };
 	const toBytes = async (url: string) => {
-		const fetched = await fetchBytes(url);
+		const fetched = await fetchBytes(url, fetchOpts);
+		if (kind === "video") return fetched;
 		return context.cenc ? await decryptIfNeeded(fetched, context.cenc) : fetched;
 	};
 
@@ -112,18 +119,47 @@ export async function readPlaylistSegments(
 		state.initEmitted = true;
 	}
 
+	let added = 0;
 	for (const relative of parsed.segmentUrls) {
+		if (added >= maxSegmentsPerPoll) break;
 		const absolute = new URL(relative, base).toString();
 		if (state.seen.has(absolute)) continue;
 		state.seen.add(absolute);
 		payloads.push(await toBytes(absolute));
+		added += 1;
 	}
 
 	return payloads;
 }
 
+/** Returns segment URLs only (no fetch); for video transcode so demuxer can open URLs. */
+export async function readPlaylistSegmentUrls(
+	parsed: ParsedM3u8Media,
+	state: { seen: ReturnType<typeof createBoundedSeen>; initEmitted: boolean },
+	base: URL,
+): Promise<SegmentUrlBatch> {
+	const segmentUrls: string[] = [];
+	let initUrl: string | undefined;
+	if (parsed.initUrl && !state.initEmitted) {
+		initUrl = new URL(parsed.initUrl, base).toString();
+		if (!state.seen.has(initUrl)) state.seen.add(initUrl);
+		state.initEmitted = true;
+	}
+	let added = 0;
+	for (const relative of parsed.segmentUrls) {
+		if (added >= maxSegmentsPerPoll) break;
+		const absolute = new URL(relative, base).toString();
+		if (state.seen.has(absolute)) continue;
+		state.seen.add(absolute);
+		segmentUrls.push(absolute);
+		added += 1;
+	}
+	return { initUrl, segmentUrls };
+}
+
 export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<RunnerConfig[]> {
-	const raw = await fetchText(context.stream.url);
+	const fetchOpts = { headers: context.stream.headers };
+	const raw = await fetchText(context.stream.url, fetchOpts);
 	const playlistUrl = new URL(context.stream.url);
 	const configs: RunnerConfig[] = [];
 	if (!isHlsMasterPlaylist(raw)) {
@@ -132,29 +168,41 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			initEmitted: false,
 		};
 		const pollMs = defaultPollMs;
-		let codecDescription: string | undefined;
 		const parsed = parseM3u8Media(raw, playlistUrl);
-		if (parsed.initUrl) {
-			const initUrl = new URL(parsed.initUrl, playlistUrl).toString();
-			try {
-				const bytes = await fetchBytes(initUrl);
-				const rawInit = context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes;
-				codecDescription = parseAvcCFromInitSegment(rawInit);
-			} catch {
-				// optional
-			}
-		}
+		const audioTrackRef: MuxedAudioTrackRef = { current: null };
+		const nextSegments = async () => {
+			const current = await fetchText(context.stream.url, fetchOpts);
+			const p = parseM3u8Media(current, playlistUrl);
+			return readPlaylistSegments(context, p, state, playlistUrl, "video");
+		};
+		const nextSegmentUrls = async (): Promise<SegmentUrlBatch> => {
+			const current = await fetchText(context.stream.url, fetchOpts);
+			const p = parseM3u8Media(current, playlistUrl);
+			return readPlaylistSegmentUrls(p, state, playlistUrl);
+		};
 		configs.push({
 			streamName: context.stream.name,
 			name: "video/0",
+			kind: "video",
 			cenc: context.cenc,
 			pollMs,
-			codecDescription,
-			nextSegments: async () => {
-				const current = await fetchText(context.stream.url);
-				const p = parseM3u8Media(current, playlistUrl);
-				return readPlaylistSegments(context, p, state, playlistUrl);
-			},
+			codec: AVC_CODEC_STRING,
+			codecDescription: getDefaultAvcCDescription(),
+			nextSegments,
+			nextSegmentUrls,
+			headers: context.stream.headers,
+			audioTrackRef,
+		});
+		configs.push({
+			streamName: context.stream.name,
+			name: "audio/0",
+			kind: "audio",
+			cenc: context.cenc,
+			pollMs,
+			nextSegments,
+			codec: "mp4a.40.2",
+			isMuxedAudioOnly: true,
+			audioTrackRef,
 		});
 		return configs;
 	}
@@ -169,28 +217,18 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			initEmitted: false,
 		};
 		const pollMs = defaultPollMs;
-		let codecDescription: string | undefined;
-		try {
-			const parsed = parseM3u8Media(raw, playlistUrl);
-			if (parsed.initUrl) {
-				const initUrl = new URL(parsed.initUrl, playlistUrl).toString();
-				const bytes = await fetchBytes(initUrl);
-				const rawInit = context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes;
-				codecDescription = parseAvcCFromInitSegment(rawInit);
-			}
-		} catch {
-			// optional
-		}
 		configs.push({
 			streamName: context.stream.name,
 			name: "video/0",
+			kind: "video",
 			cenc: context.cenc,
 			pollMs,
-			codecDescription,
+			codec: AVC_CODEC_STRING,
+			codecDescription: getDefaultAvcCDescription(),
 			nextSegments: async () => {
-				const current = await fetchText(context.stream.url);
+				const current = await fetchText(context.stream.url, fetchOpts);
 				const p = parseM3u8Media(current, playlistUrl);
-				return readPlaylistSegments(context, p, state, playlistUrl);
+				return readPlaylistSegments(context, p, state, playlistUrl, "video");
 			},
 		});
 		videoIndex = 1;
@@ -203,28 +241,20 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			initEmitted: false,
 		};
 		const pollMs = Number(trackUrl.pollMs ?? defaultPollMs);
-		let codecDescription: string | undefined;
-		try {
-			const variantRaw = await fetchText(trackUrl.url);
-			const variantParsed = parseM3u8Media(variantRaw, new URL(trackUrl.url));
-			if (variantParsed.initUrl) {
-				const initUrl = new URL(variantParsed.initUrl, trackUrl.url).toString();
-				const bytes = await fetchBytes(initUrl);
-				const rawInit = context.cenc ? await decryptIfNeeded(bytes, context.cenc) : bytes;
-				codecDescription = parseAvcCFromInitSegment(rawInit);
-			}
-		} catch {
-			// optional
-		}
 		configs.push({
 			streamName: context.stream.name,
 			name,
+			kind: "video",
 			cenc: context.cenc,
 			pollMs,
-			codecDescription,
+			codec: AVC_CODEC_STRING,
+			codecDescription: getDefaultAvcCDescription(),
 			nextSegments: async () => {
-				const parsed = parseM3u8Media(await fetchText(trackUrl.url), new URL(trackUrl.url));
-				return readPlaylistSegments(context, parsed, state, new URL(trackUrl.url));
+				const parsed = parseM3u8Media(
+					await fetchText(trackUrl.url, fetchOpts),
+					new URL(trackUrl.url),
+				);
+				return readPlaylistSegments(context, parsed, state, new URL(trackUrl.url), "video");
 			},
 		});
 	}
@@ -239,14 +269,15 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 		configs.push({
 			streamName: context.stream.name,
 			name,
+			kind: "audio",
 			cenc: context.cenc,
 			pollMs,
 			nextSegments: async () => {
 				const parsed = parseM3u8Media(
-					await fetchText(audioTrack.url),
+					await fetchText(audioTrack.url, fetchOpts),
 					new URL(audioTrack.url),
 				);
-				return readPlaylistSegments(context, parsed, state, new URL(audioTrack.url));
+				return readPlaylistSegments(context, parsed, state, new URL(audioTrack.url), "audio");
 			},
 		});
 	}

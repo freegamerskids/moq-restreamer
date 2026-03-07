@@ -16,6 +16,10 @@ export interface StreamEntry {
 	name: string;
 	url: string;
 	cenc?: string;
+	/** Optional request headers (e.g. Referer) for playlist and segment fetches. */
+	headers?: Record<string, string>;
+	/** Force video codec type when init cannot be parsed; "hevc" uses hvcC default. */
+	videoCodec?: "avc" | "hevc";
 }
 
 export interface RunnerContext {
@@ -28,14 +32,37 @@ export interface ClearKey {
 	key: Uint8Array;
 }
 
+/** Ref so the transcode pipeline can publish embedded audio when the client subscribes to audio/0. */
+export interface MuxedAudioTrackRef {
+	current: Moq.Track | null;
+}
+
+/** Segment URLs for video transcode; demuxer fetches and opens these. */
+export interface SegmentUrlBatch {
+	initUrl?: string;
+	segmentUrls: string[];
+}
+
 export interface RunnerConfig {
 	name: string;
 	streamName: string;
+	/** Used to decide whether to transcode to HEVC (video) or relay raw (audio). */
+	kind: StreamKind;
 	cenc: ClearKey | null;
 	pollMs: number;
 	nextSegments: () => Promise<Uint8Array[]>;
-	/** Hex-encoded avcC (AVC decoder config) for video tracks; required for WebCodecs VideoDecoder */
+	/** When set, video runner uses URLs and transcode fetches before opening demuxer. */
+	nextSegmentUrls?: () => Promise<SegmentUrlBatch>;
+	/** Request headers for segment URL fetches (e.g. Referer). */
+	headers?: Record<string, string>;
+	/** MIME codec string for catalog (e.g. avc1.42E01E, hev1.1.6.L93.B0). */
+	codec?: string;
+	/** Hex-encoded avcC or hvcC for video; required for WebCodecs VideoDecoder. */
 	codecDescription?: string;
+	/** When set, this config is the audio side of a muxed stream; only set ref, do not start a runner. */
+	isMuxedAudioOnly?: boolean;
+	/** Shared with video runner: transcode publishes embedded audio here when set. */
+	audioTrackRef?: MuxedAudioTrackRef;
 }
 
 export interface Runner extends RunnerConfig {

@@ -1,5 +1,21 @@
 import type { ClearKey, CencSampleInfo, MoofSencInfo } from "./types.js";
 
+/** 16-byte key as 32-char hex for FFmpeg mov demuxer decryption_key option. */
+function keyToHex(key: Uint8Array): string {
+	let hex = "";
+	for (let i = 0; i < key.length; i++) hex += key[i]!.toString(16).padStart(2, "0");
+	return hex;
+}
+
+/**
+ * Options for node-av Demuxer.open() to decrypt CENC (AES-128 CTR) with FFmpeg.
+ * Pass as second argument: Demuxer.open(buffer, getCencDemuxerOptions(cenc)).
+ */
+export function getCencDemuxerOptions(cenc: ClearKey | null): { options: { decryption_key: string } } | undefined {
+	if (!cenc || cenc.key.length !== 16) return undefined;
+	return { options: { decryption_key: keyToHex(cenc.key) } };
+}
+
 export async function decryptIfNeeded(data: Uint8Array, cenc: ClearKey): Promise<Uint8Array> {
 	try {
 		const mp4 = new Uint8Array(data);
