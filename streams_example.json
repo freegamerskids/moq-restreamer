@@ -1,0 +1,11 @@
+[
+  {
+    "name": "ls1",
+    "url": "https://example.com/playlisy/mpd",
+    "cenc": "example_kid:example_key"
+  },
+  {
+    "name": "ls2",
+    "url": "https://example.com/playlist.m3u8"
+  }
+]
