@@ -12,7 +12,10 @@ export function serveCatalog(
 	track: Moq.Track,
 	configMap: Map<string, RunnerConfig>,
 ): void {
-	const videoRenditions: Record<string, { codec: string; container: { kind: "legacy" } }> = {};
+	const videoRenditions: Record<
+		string,
+		{ codec: string; container: { kind: "legacy" }; description?: string }
+	> = {};
 	const audioRenditions: Record<
 		string,
 		{ codec: string; container: { kind: "legacy" }; sampleRate: number; numberOfChannels: number }
@@ -22,6 +25,7 @@ export function serveCatalog(
 		if (trackName.startsWith("video/")) {
 			videoRenditions[trackName] = {
 				codec: config.codec ?? AVC_CODEC_STRING,
+				...(config.codecDescription && { description: config.codecDescription }),
 				container: legacyContainer,
 			};
 		} else if (trackName.startsWith("audio/")) {

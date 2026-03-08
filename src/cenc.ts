@@ -1,3 +1,5 @@
+import { createDecipheriv } from "node:crypto";
+
 import type { ClearKey, CencSampleInfo, MoofSencInfo } from "./types.js";
 
 /** 16-byte key as 32-char hex for FFmpeg mov demuxer decryption_key option. */
@@ -9,19 +11,21 @@ function keyToHex(key: Uint8Array): string {
 
 /**
  * Options for node-av Demuxer.open() to decrypt CENC (AES-128 CTR) with FFmpeg.
- * Pass as second argument: Demuxer.open(buffer, getCencDemuxerOptions(cenc)).
+ * node-av supports format options via Demuxer.open(path, { options: { decryption_key: hex } }),
+ * but webcodecs-node’s Demuxer only calls NodeAvDemuxer.open(path) with no options, so the key
+ * cannot be passed through the polyfill. Use decryptIfNeeded() before demux instead.
  */
 export function getCencDemuxerOptions(cenc: ClearKey | null): { options: { decryption_key: string } } | undefined {
 	if (!cenc || cenc.key.length !== 16) return undefined;
 	return { options: { decryption_key: keyToHex(cenc.key) } };
 }
 
-export async function decryptIfNeeded(data: Uint8Array, cenc: ClearKey): Promise<Uint8Array> {
+export function decryptIfNeeded(data: Uint8Array, cenc: ClearKey): Uint8Array {
 	try {
 		const mp4 = new Uint8Array(data);
 		const parsed = parseMoofAndCencInfo(mp4);
 		if (!parsed) return mp4;
-		return await decryptCencData(mp4, parsed, cenc.key);
+		return decryptCencData(mp4, parsed, cenc.key);
 	} catch {
 		return data;
 	}
@@ -150,13 +154,11 @@ function parseSencBox(payload: Uint8Array, start: number, end: number): CencSamp
 	return entries;
 }
 
-async function decryptCencData(
-	payload: Uint8Array,
-	info: MoofSencInfo,
-	key: Uint8Array,
-): Promise<Uint8Array> {
+function decryptCencData(payload: Uint8Array, info: MoofSencInfo, key: Uint8Array): Uint8Array {
 	if (!info.senc || !info.trunSampleSizes || info.trunSampleSizes.length === 0) return payload;
-	const baseOffset = info.mdatStart + Math.max(0, info.trunDataOffset || 0);
+	// trun data_offset is from segment start (moofStart); first sample = mdat content start + offset within mdat
+	const offsetWithinMdat = (info.trunDataOffset ?? 0) - (info.mdatStart - info.moofStart);
+	const baseOffset = info.mdatStart + Math.max(0, offsetWithinMdat);
 	const sampleSizes = info.trunSampleSizes;
 	const sampleOffsets: number[] = [];
 	let running = baseOffset;
@@ -169,7 +171,7 @@ async function decryptCencData(
 		return payload;
 	}
 
-	const importedKey = await crypto.subtle.importKey("raw", key, "AES-CTR", false, ["decrypt"]);
+	const keyBuf = Buffer.from(key);
 	for (let s = 0; s < sampleOffsets.length && s < info.senc.length; s += 1) {
 		const sampleStart = sampleOffsets[s]!;
 		const size = sampleSizes[s] ?? 0;
@@ -186,15 +188,10 @@ async function decryptCencData(
 			clearOffset += sub.clear;
 			if (sub.encrypted <= 0) continue;
 			const limit = Math.min(payload.length, cursor + sub.encrypted);
-			const encrypted = payload.slice(cursor, limit);
+			const encrypted = payload.subarray(cursor, limit);
 			const counter = incrementCounter(sampleInfo.iv, Math.floor(clearOffset / 16));
-			const decrypted = new Uint8Array(
-				await crypto.subtle.decrypt(
-					{ name: "AES-CTR", counter, length: 64 },
-					importedKey,
-					encrypted,
-				),
-			);
+			const decipher = createDecipheriv("aes-128-ctr", keyBuf, Buffer.from(counter));
+			const decrypted = Buffer.concat([decipher.update(Buffer.from(encrypted)), decipher.final()]);
 			payload.set(decrypted, cursor);
 			cursor += encrypted.length;
 			clearOffset += encrypted.length;

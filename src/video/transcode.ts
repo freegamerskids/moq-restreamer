@@ -1,27 +1,46 @@
 /**
  * Transcode pipeline: fMP4 segments → demux → decode → [scale] → frames for encoding.
- * Uses node-av Demuxer (init+segment buffer) and Decoder; CENC decryption via Demuxer options.
- * Optional scale to fixed size to keep encoder MB rate within H.264 level limits.
+ * Uses webcodecs-node (aptum) Demuxer + VideoDecoder; CENC decryption in JS before demux.
+ * Optional scale to fixed size via webcodecs-node createCanvas.
+ *
+ * @see https://github.com/aptumfr/webcodecs-node
  */
 
-import { Decoder } from "node-av/api";
-import { Demuxer } from "node-av/api";
-import { FilterAPI } from "node-av/api";
-import type { Frame } from "node-av";
+import { writeFile, unlink } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomBytes } from "node:crypto";
 
-import { getCencDemuxerOptions } from "../cenc.js";
+import {
+	createCanvas,
+	VideoDecoder,
+	VideoFrame,
+	type EncodedAudioChunk,
+	type EncodedVideoChunk,
+} from "webcodecs-node";
+import { Demuxer } from "webcodecs-node/containers";
+
+import { decryptIfNeeded, getCencDemuxerOptions } from "../cenc.js";
+import "./demuxer-cenc-patch.js";
 import { fetchBytes } from "../fetch.js";
+import {
+	bytesToHex,
+	getVideoCodecFromInitSegment,
+	hexToBytes,
+} from "../init-segment.js";
 import type { ClearKey, MuxedAudioTrackRef } from "../types.js";
 
 export interface TranscodeOptions {
-	/** Scale output to this width (avoids libx264 MB rate over level limit). */
+	/** Scale output to this width (avoids encoder MB rate over level limit). */
 	scaleWidth?: number;
 	/** Scale output to this height. */
 	scaleHeight?: number;
-	/** When set, embedded audio from demuxed segments is published here (raw packets). */
+	/** When set, embedded audio from demuxed segments is published here (raw encoded packets). */
 	audioTrackRef?: MuxedAudioTrackRef | null;
 	/** Request headers when fetching segment URLs (used when queue yields strings). */
 	fetchOptions?: { headers?: Record<string, string> };
+	/** Called when video config (codec + description) is known from the first decoded segment; use to push description into catalog renditions. */
+	onVideoConfig?: (config: { codec: string; descriptionHex?: string }) => void;
 }
 
 /** Queue item: URL (string) or pre-fetched bytes. When string, transcode fetches before opening demuxer. */
@@ -65,14 +84,6 @@ function isInitSegment(payload: Uint8Array): boolean {
 	);
 }
 
-/**
- * Yields decoded video frames from a queue of fMP4 payloads.
- * First payload is used as init only when it contains ftyp; otherwise it is skipped (no demux of bare segments).
- * For each following payload we open demuxer on (init+segment), decode video packets, optionally scale, yield frames.
- * When cenc is set, node-av decrypts CENC (AES-128 CTR) via decryption_key option.
- * When options.audioTrackRef is set and segments contain audio, raw audio packets are published to ref.current.
- * Never yields null (encoder runs until track closes).
- */
 async function toBytes(
 	item: SegmentQueueItem,
 	fetchOpts?: { headers?: Record<string, string> },
@@ -83,31 +94,87 @@ async function toBytes(
 	return item;
 }
 
+function copyChunkData(chunk: EncodedAudioChunk): Uint8Array {
+	const buf = new Uint8Array(chunk.byteLength);
+	chunk.copyTo(buf);
+	return buf;
+}
+
+/** Max chunks to allow in the decoder queue before applying backpressure. */
+const DECODER_QUEUE_BACKPRESSURE = 24;
+
+/**
+ * Wait for the decoder to have queue space before decoding more chunks.
+ * Prevents QuotaExceededError when demuxer produces chunks faster than the decoder drains.
+ */
+function waitForDecoderQueueSpace(
+	decoder: VideoDecoder,
+	maxPending: number,
+): Promise<void> {
+	if (decoder.decodeQueueSize < maxPending) return Promise.resolve();
+	return new Promise((resolve) => {
+		const onDequeue = () => {
+			decoder.removeEventListener("dequeue", onDequeue);
+			if (decoder.decodeQueueSize < maxPending) {
+				resolve();
+			} else {
+				waitForDecoderQueueSpace(decoder, maxPending).then(resolve);
+			}
+		};
+		decoder.addEventListener("dequeue", onDequeue);
+	});
+}
+
+/** Scale a VideoFrame to target dimensions using canvas (RGBA path). */
+async function scaleFrame(
+	frame: VideoFrame,
+	targetWidth: number,
+	targetHeight: number,
+): Promise<VideoFrame> {
+	const w = frame.codedWidth;
+	const h = frame.codedHeight;
+	const timestamp = frame.timestamp;
+	const duration = frame.duration ?? undefined;
+	const size = frame.allocationSize({ format: "RGBA" });
+	const buf = new Uint8Array(size);
+	await frame.copyTo(buf, { format: "RGBA" });
+	frame.close();
+
+	const small = createCanvas({width: w, height: h});
+	const smallCtx = small.getContext("2d");
+	const imageData = smallCtx.createImageData(w, h);
+	imageData.data.set(buf.subarray(0, w * h * 4));
+	smallCtx.putImageData(imageData, 0, 0);
+
+	const out = createCanvas({width: targetWidth, height: targetHeight});
+	const outCtx = out.getContext("2d");
+	outCtx.drawImage(small, 0, 0, w, h, 0, 0, targetWidth, targetHeight);
+
+	return new VideoFrame(out, { timestamp, duration });
+}
+
+function tempPath(): string {
+	return join(tmpdir(), `moq-seg-${randomBytes(8).toString("hex")}.mp4`);
+}
+
+/**
+ * Yields decoded video frames from a queue of fMP4 payloads.
+ * Uses webcodecs-node Demuxer (file-based); writes init+segment to a temp file per segment.
+ * When cenc is set, we decrypt in JS (decryptIfNeeded) before demux.
+ * When options.audioTrackRef is set, raw encoded audio chunks are published to ref.current.
+ */
 export async function* framesFromSegments(
 	queue: SegmentQueue,
 	cenc: ClearKey | null,
 	options?: TranscodeOptions,
-): AsyncGenerator<Frame, void, undefined> {
+): AsyncGenerator<VideoFrame, void, undefined> {
 	const first = await queue.next();
 	if (first.done || !first.value) return;
 	const firstPayload = await toBytes(first.value, options?.fetchOptions);
-	const demuxerOpts = getCencDemuxerOptions(cenc);
 	const scaleW = options?.scaleWidth;
 	const scaleH = options?.scaleHeight;
 	const audioTrackRef = options?.audioTrackRef;
 	const fetchOpts = options?.fetchOptions;
-	const scaleFilterRef: { current: ReturnType<typeof FilterAPI.create> | null } = {
-		current: null,
-	};
-
-	let initBuffer: Buffer | null = null;
-	if (isInitSegment(firstPayload)) {
-		initBuffer = Buffer.from(firstPayload);
-	}
-	// When first payload is not init (e.g. no EXT-X-MAP), open it as standalone once.
-	if (!initBuffer) {
-		yield* drainSegment(Buffer.from(firstPayload), demuxerOpts);
-	}
 
 	function publishAudioPacket(data: Uint8Array): void {
 		const track = audioTrackRef?.current;
@@ -121,85 +188,128 @@ export async function* framesFromSegments(
 		}
 	}
 
+	let initBuffer: Uint8Array | null = null;
+	if (isInitSegment(firstPayload)) {
+		initBuffer = firstPayload;
+	} else {
+		yield* drainSegment(firstPayload, cenc, publishAudioPacket, scaleW, scaleH);
+	}
+
 	async function* drainSegment(
-		segmentBuffer: Buffer,
-		opts: ReturnType<typeof getCencDemuxerOptions>,
-	): AsyncGenerator<Frame, void, undefined> {
-		let demuxer: Awaited<ReturnType<typeof Demuxer.open>>;
+		segmentBuffer: Uint8Array,
+		clearKey: ClearKey | null,
+		publishAudio: (data: Uint8Array) => void,
+		scaleWidth: number | undefined,
+		scaleHeight: number | undefined,
+	): AsyncGenerator<VideoFrame, void, undefined> {
+		const useLibavCenc = clearKey ? getCencDemuxerOptions(clearKey) : undefined;
+		let buffer = segmentBuffer;
+		if (clearKey && !useLibavCenc) {
+			buffer = decryptIfNeeded(buffer, clearKey);
+		}
+		const path = tempPath();
 		try {
-			demuxer = await Demuxer.open(segmentBuffer, {
-				options: {
-					t: 1
-				},
-				...opts
-			});
-		} catch {
+			await writeFile(path, buffer);
+		} catch (e) {
+			console.error("[transcode] Failed to write temp segment:", e);
 			return;
 		}
 		try {
-			const audioStream = demuxer.audio();
-			if (audioStream && audioTrackRef) {
-				for await (const pkt of demuxer.packets(audioStream.index)) {
-					if (pkt?.data && pkt.data.length > 0) {
-						publishAudioPacket(new Uint8Array(pkt.data));
-					}
-					pkt?.free();
+			const demuxer = new Demuxer({ path });
+			if (useLibavCenc) {
+				(demuxer as { _demuxerOptions?: typeof useLibavCenc })._demuxerOptions = useLibavCenc;
+			}
+			await demuxer.open();
+			const videoConfig = demuxer.videoConfig;
+			if (!videoConfig) {
+				await demuxer.close();
+				return;
+			}
+			// AVC/HEVC require description (avcC/hvcC). Use demuxer's or parse from init in buffer.
+			const codec = videoConfig.codec;
+			const needsDescription =
+				codec.startsWith("avc1") ||
+				codec.startsWith("avc3") ||
+				codec.startsWith("hvc1") ||
+				codec.startsWith("hev1");
+			let description: ArrayBuffer | ArrayBufferView | undefined = videoConfig.description;
+			if (needsDescription && !description) {
+				const parsed = getVideoCodecFromInitSegment(buffer);
+				if (parsed.codecDescription) {
+					description = hexToBytes(parsed.codecDescription);
 				}
 			}
+			const descriptionHex =
+				description !== undefined
+					? bytesToHex(
+							description instanceof ArrayBuffer
+								? new Uint8Array(description)
+								: new Uint8Array(
+										description.buffer,
+										description.byteOffset,
+										description.byteLength,
+									),
+						)
+					: undefined;
+			options?.onVideoConfig?.({ codec, descriptionHex });
+			const frames: VideoFrame[] = [];
+			const videoDecoder = new VideoDecoder({
+				output: (frame: VideoFrame) => frames.push(frame),
+				error: (e: Error) => console.error("[transcode] VideoDecoder error:", e),
+			});
+			videoDecoder.configure({
+				codec: videoConfig.codec,
+				codedWidth: videoConfig.codedWidth,
+				codedHeight: videoConfig.codedHeight,
+				...(description && { description }),
+			});
+			let needKeyframe = true;
+			for await (const chunk of demuxer.videoChunks()) {
+				const enc = chunk as EncodedVideoChunk;
+				if (needKeyframe && enc.type !== "key") continue;
+				needKeyframe = false;
+				await waitForDecoderQueueSpace(videoDecoder, DECODER_QUEUE_BACKPRESSURE);
+				videoDecoder.decode(enc);
+			}
+			await videoDecoder.flush();
+			videoDecoder.close();
 
-			const videoStream = demuxer.video();
-			if (!videoStream) return;
-			const decoder = await Decoder.create(videoStream);
-			try {
-				async function* packetsThenNull(
-					dmx: Awaited<ReturnType<typeof Demuxer.open>>,
-					streamIndex: number,
-				): AsyncGenerator<import("node-av").Packet | null> {
-					for await (const pkt of dmx.packets(streamIndex)) {
-						yield pkt;
-						if (pkt) pkt.free();
-					}
-					yield null;
+			// Publish audio if demuxer exposes audioChunks
+			const audioChunks = (demuxer as { audioChunks?: () => AsyncIterable<EncodedAudioChunk> })
+				.audioChunks;
+			if (typeof audioChunks === "function") {
+				for await (const chunk of audioChunks.call(demuxer)) {
+					publishAudio(copyChunkData(chunk));
 				}
-				for await (const frame of decoder.frames(
-					packetsThenNull(demuxer, videoStream.index),
-				)) {
-					if (frame === null) continue;
-					if (scaleW != null && scaleH != null && scaleW > 0 && scaleH > 0) {
-						if (!scaleFilterRef.current) {
-							scaleFilterRef.current = FilterAPI.create(
-								`scale=${scaleW}:${scaleH}`,
-								{ allowReinit: true },
-							);
-						}
-						try {
-							await scaleFilterRef.current.process(frame);
-							frame.free();
-							let out: Frame | null;
-							while ((out = (await scaleFilterRef.current.receive()) as Frame | null) != null) {
-								if (typeof out === "object" && "width" in out) yield out;
-								else break;
-							}
-						} catch {
-							frame.free();
-						}
-					} else {
-						yield frame;
-					}
+			}
+			await demuxer.close();
+
+			for (const frame of frames) {
+				if (frame.closed) continue;
+				if (
+					scaleWidth != null &&
+					scaleHeight != null &&
+					scaleWidth > 0 &&
+					scaleHeight > 0 &&
+					(frame.codedWidth !== scaleWidth || frame.codedHeight !== scaleHeight)
+				) {
+					const scaled = await scaleFrame(frame, scaleWidth, scaleHeight);
+					yield scaled;
+				} else {
+					yield frame;
 				}
-			} finally {
-				decoder[Symbol.dispose]?.() ?? (decoder as { close?: () => void }).close?.();
 			}
 		} finally {
-			await demuxer.close();
+			await unlink(path).catch(() => {});
 		}
 	}
 
 	for await (const segmentItem of queue) {
 		if (!initBuffer) continue;
 		const segmentBytes = await toBytes(segmentItem, fetchOpts);
-		const segmentBuffer = Buffer.from(segmentBytes);
-		const buffer = Buffer.concat([initBuffer, segmentBuffer]);
-		yield* drainSegment(buffer, demuxerOpts);
+		const buffer = new Uint8Array(initBuffer.length + segmentBytes.length);
+		buffer.set(initBuffer);
+		buffer.set(segmentBytes, initBuffer.length);
+		yield* drainSegment(buffer, cenc, publishAudioPacket, scaleW, scaleH);
 	}
 }

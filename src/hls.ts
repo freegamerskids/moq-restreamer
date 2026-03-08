@@ -217,6 +217,16 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			initEmitted: false,
 		};
 		const pollMs = defaultPollMs;
+		const nextSegments = async () => {
+			const current = await fetchText(context.stream.url, fetchOpts);
+			const p = parseM3u8Media(current, playlistUrl);
+			return readPlaylistSegments(context, p, state, playlistUrl, "video");
+		};
+		const nextSegmentUrls = async (): Promise<SegmentUrlBatch> => {
+			const current = await fetchText(context.stream.url, fetchOpts);
+			const p = parseM3u8Media(current, playlistUrl);
+			return readPlaylistSegmentUrls(p, state, playlistUrl);
+		};
 		configs.push({
 			streamName: context.stream.name,
 			name: "video/0",
@@ -225,11 +235,9 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			pollMs,
 			codec: AVC_CODEC_STRING,
 			codecDescription: getDefaultAvcCDescription(),
-			nextSegments: async () => {
-				const current = await fetchText(context.stream.url, fetchOpts);
-				const p = parseM3u8Media(current, playlistUrl);
-				return readPlaylistSegments(context, p, state, playlistUrl, "video");
-			},
+			nextSegments,
+			nextSegmentUrls,
+			headers: context.stream.headers,
 		});
 		videoIndex = 1;
 	}
@@ -240,7 +248,18 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			seen: createBoundedSeen(seenUrlLimit),
 			initEmitted: false,
 		};
+		const mediaBase = new URL(trackUrl.url);
 		const pollMs = Number(trackUrl.pollMs ?? defaultPollMs);
+		const nextSegments = async () => {
+			const current = await fetchText(trackUrl.url, fetchOpts);
+			const p = parseM3u8Media(current, mediaBase);
+			return readPlaylistSegments(context, p, state, mediaBase, "video");
+		};
+		const nextSegmentUrls = async (): Promise<SegmentUrlBatch> => {
+			const current = await fetchText(trackUrl.url, fetchOpts);
+			const p = parseM3u8Media(current, mediaBase);
+			return readPlaylistSegmentUrls(p, state, mediaBase);
+		};
 		configs.push({
 			streamName: context.stream.name,
 			name,
@@ -249,13 +268,9 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			pollMs,
 			codec: AVC_CODEC_STRING,
 			codecDescription: getDefaultAvcCDescription(),
-			nextSegments: async () => {
-				const parsed = parseM3u8Media(
-					await fetchText(trackUrl.url, fetchOpts),
-					new URL(trackUrl.url),
-				);
-				return readPlaylistSegments(context, parsed, state, new URL(trackUrl.url), "video");
-			},
+			nextSegments,
+			nextSegmentUrls,
+			headers: context.stream.headers,
 		});
 	}
 

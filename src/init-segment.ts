@@ -38,7 +38,9 @@ export function getVideoCodecFromInitSegment(
 	rawInit: Uint8Array,
 	preferHevc?: boolean,
 ): { codec: string; codecDescription: string } {
+	console.log("rawInit", rawInit);
 	const avcC = parseAvcCFromInitSegment(rawInit);
+	console.log("avcC", avcC);
 	if (avcC) return { codec: AVC_CODEC_STRING, codecDescription: avcC };
 	const hvcC = parseHvcCFromInitSegment(rawInit);
 	if (hvcC) return { codec: HEVC_CODEC_STRING, codecDescription: hvcC };
@@ -55,6 +57,16 @@ export function bytesToHex(bytes: Uint8Array): string {
 		hex += (bytes[i] ?? 0).toString(16).padStart(2, "0");
 	}
 	return hex;
+}
+
+/** Convert hex string to bytes (for WebCodecs VideoDecoderConfig.description). */
+export function hexToBytes(hex: string): Uint8Array {
+	const len = hex.length >> 1;
+	const arr = new Uint8Array(len);
+	for (let i = 0; i < len; i++) {
+		arr[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+	}
+	return arr;
 }
 
 /**
@@ -102,6 +114,7 @@ export function parseAvcCFromInitSegment(initSegment: Uint8Array): string | unde
 		}
 		return undefined;
 	};
+	console.log("initSegment", initSegment);
 
 	const moov = findBox(0, initSegment.length, "moov");
 	if (!moov) return undefined;
@@ -115,6 +128,7 @@ export function parseAvcCFromInitSegment(initSegment: Uint8Array): string | unde
 	if (!stbl) return undefined;
 	const stsd = findBox(stbl[0], stbl[1], "stsd");
 	if (!stsd) return undefined;
+	console.log("stsd", stsd);
 	let pos = stsd[0] + 8;
 	while (pos + 8 <= stsd[1]) {
 		const [contentStart, boxEnd, type] = nextBox(pos);

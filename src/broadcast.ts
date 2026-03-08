@@ -125,12 +125,18 @@ async function runVideoTranscodeRunner(runner: Runner): Promise<void> {
 			scaleHeight: 1080,
 			audioTrackRef: runner.audioTrackRef ?? undefined,
 			fetchOptions: runner.headers ? { headers: runner.headers } : undefined,
+			onVideoConfig: ({ codec, descriptionHex }) => {
+				runner.codec = codec;
+				runner.codecDescription = descriptionHex;
+			},
 		}),
 	);
+	// Continuously re-fetch playlist/manifest to discover new segments (live streams).
 	while (true) {
 		try {
 			if (useUrls && runner.nextSegmentUrls) {
 				const batch = await runner.nextSegmentUrls();
+				if (batch.initUrl) queue.push(batch.initUrl);
 				for (const url of batch.segmentUrls) queue.push(url);
 				await sleep(batch.segmentUrls.length === 0 ? runner.pollMs : 100);
 			} else {

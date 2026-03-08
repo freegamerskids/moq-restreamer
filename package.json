@@ -17,9 +17,12 @@
     "@fails-components/webtransport-transport-http3-quiche": "^1.5.3",
     "@moq/hang": "^0.2.0",
     "@moq/lite": "^0.1.5",
-    "node-av": "^5.2.2"
+    "node-av": "^5.2.2",
+    "webcodecs-node": "^0.8.5"
   },
   "trustedDependencies": [
-    "@fails-components/webtransport-transport-http3-quiche"
+    "@fails-components/webtransport-transport-http3-quiche",
+    "node-av",
+    "skia-canvas"
   ]
 }
