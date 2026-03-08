@@ -7,6 +7,7 @@
  */
 
 import { writeFile, unlink } from "node:fs/promises";
+import { setTimeout as sleep } from "node:timers/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { randomBytes } from "node:crypto";
@@ -43,6 +44,17 @@ export interface TranscodeOptions {
 	onVideoConfig?: (config: { codec: string; descriptionHex?: string }) => void;
 }
 
+export interface PassthroughOptions {
+	/** Called for each encoded video chunk (raw NALUs). */
+	onVideoChunk: (data: Uint8Array) => void;
+	/** Called for each encoded audio chunk when demuxer exposes audio. */
+	onAudioChunk?: (data: Uint8Array) => void;
+	/** Called once when video config is known from init; use for catalog codec/description. */
+	onVideoConfig?: (config: { codec: string; descriptionHex?: string }) => void;
+	/** Request headers when fetching segment URLs. */
+	fetchOptions?: { headers?: Record<string, string> };
+}
+
 /** Queue item: URL (string) or pre-fetched bytes. When string, transcode fetches before opening demuxer. */
 export type SegmentQueueItem = string | Uint8Array;
 
@@ -51,13 +63,17 @@ export class SegmentQueue {
 	#items: SegmentQueueItem[] = [];
 	#wait: ((value: IteratorResult<SegmentQueueItem, void>) => void) | null = null;
 
+	get length(): number {
+		return this.#items.length;
+	}
+
 	push(payload: SegmentQueueItem): void {
-		if (this.#wait) {
+		this.#items.push(payload);
+		if (this.#wait && this.#items.length > 0) {
 			const w = this.#wait;
 			this.#wait = null;
-			w({ value: payload, done: false });
-		} else {
-			this.#items.push(payload);
+			const value = this.#items.shift()!;
+			w({ value, done: false });
 		}
 	}
 
@@ -95,6 +111,12 @@ async function toBytes(
 }
 
 function copyChunkData(chunk: EncodedAudioChunk): Uint8Array {
+	const buf = new Uint8Array(chunk.byteLength);
+	chunk.copyTo(buf);
+	return buf;
+}
+
+function copyVideoChunkData(chunk: EncodedVideoChunk): Uint8Array {
 	const buf = new Uint8Array(chunk.byteLength);
 	chunk.copyTo(buf);
 	return buf;
@@ -284,8 +306,11 @@ export async function* framesFromSegments(
 			}
 			await demuxer.close();
 
+			const defaultFrameDurationUs = 1e6 / 30; // 30 fps fallback
 			for (const frame of frames) {
+				// @ts-expect-error
 				if (frame.closed) continue;
+				const durationMs = (frame.duration ?? defaultFrameDurationUs) / 1000;
 				if (
 					scaleWidth != null &&
 					scaleHeight != null &&
@@ -298,6 +323,7 @@ export async function* framesFromSegments(
 				} else {
 					yield frame;
 				}
+				await sleep(durationMs);
 			}
 		} finally {
 			await unlink(path).catch(() => {});
@@ -311,5 +337,116 @@ export async function* framesFromSegments(
 		buffer.set(initBuffer);
 		buffer.set(segmentBytes, initBuffer.length);
 		yield* drainSegment(buffer, cenc, publishAudioPacket, scaleW, scaleH);
+	}
+}
+
+/**
+ * Forwards encoded video (and audio) chunks from a segment queue without decode/encode.
+ * Demuxes each segment and calls onVideoChunk for each EncodedVideoChunk, onAudioChunk for audio.
+ * Calls onVideoConfig once from the first init for catalog codec/description.
+ */
+export async function passthroughFromSegments(
+	queue: SegmentQueue,
+	cenc: ClearKey | null,
+	options: PassthroughOptions,
+): Promise<void> {
+	const fetchOpts = options.fetchOptions;
+	const first = await queue.next();
+	if (first.done || !first.value) return;
+	const firstPayload = await toBytes(first.value, fetchOpts);
+
+	let initBuffer: Uint8Array | null = null;
+	if (isInitSegment(firstPayload)) {
+		initBuffer = firstPayload;
+	} else {
+		await drainSegmentPassthrough(firstPayload, cenc, options);
+	}
+
+	async function drainSegmentPassthrough(
+		segmentBuffer: Uint8Array,
+		clearKey: ClearKey | null,
+		opts: PassthroughOptions,
+	): Promise<void> {
+		const useLibavCenc = clearKey ? getCencDemuxerOptions(clearKey) : undefined;
+		let buffer = segmentBuffer;
+		if (clearKey && !useLibavCenc) {
+			buffer = decryptIfNeeded(buffer, clearKey);
+		}
+		const path = tempPath();
+		try {
+			await writeFile(path, buffer);
+		} catch (e) {
+			console.error("[transcode] Failed to write temp segment (passthrough):", e);
+			return;
+		}
+		let demuxer: InstanceType<typeof Demuxer> | null = null;
+		try {
+			demuxer = new Demuxer({ path });
+			if (useLibavCenc) {
+				(demuxer as { _demuxerOptions?: typeof useLibavCenc })._demuxerOptions = useLibavCenc;
+			}
+			await demuxer.open();
+			const videoConfig = demuxer.videoConfig;
+			if (!videoConfig) {
+				await demuxer.close();
+				return;
+			}
+			const codec = videoConfig.codec;
+			const needsDescription =
+				codec.startsWith("avc1") ||
+				codec.startsWith("avc3") ||
+				codec.startsWith("hvc1") ||
+				codec.startsWith("hev1");
+			let description: ArrayBuffer | ArrayBufferView | undefined = videoConfig.description;
+			if (needsDescription && !description) {
+				const parsed = getVideoCodecFromInitSegment(buffer);
+				if (parsed.codecDescription) {
+					description = hexToBytes(parsed.codecDescription);
+				}
+			}
+			const descriptionHex =
+				description !== undefined
+					? bytesToHex(
+							description instanceof ArrayBuffer
+								? new Uint8Array(description)
+								: new Uint8Array(
+										description.buffer,
+										description.byteOffset,
+										description.byteLength,
+									),
+						)
+					: undefined;
+			opts.onVideoConfig?.({ codec, descriptionHex });
+			for await (const chunk of demuxer.videoChunks()) {
+				opts.onVideoChunk(copyVideoChunkData(chunk as EncodedVideoChunk));
+			}
+			const audioChunks = (demuxer as { audioChunks?: () => AsyncIterable<EncodedAudioChunk> })
+				.audioChunks;
+			if (typeof audioChunks === "function" && opts.onAudioChunk) {
+				for await (const chunk of audioChunks.call(demuxer)) {
+					opts.onAudioChunk(copyChunkData(chunk));
+				}
+			}
+			await demuxer.close();
+		} catch (e) {
+			// Skip bad segment (invalid fMP4, missing trex/tfhd, re-init, etc.); avoid process crash
+			console.error("[transcode] Passthrough demux error, skipping segment:", e);
+			try {
+				if (demuxer) await demuxer.close();
+			} catch {
+				// ignore
+			}
+		} finally {
+			await unlink(path).catch(() => {});
+		}
+	}
+
+	for await (const segmentItem of queue) {
+		if (!initBuffer) continue;
+		const segmentBytes = await toBytes(segmentItem, fetchOpts);
+		const buffer = new Uint8Array(initBuffer.length + segmentBytes.length);
+		buffer.set(initBuffer);
+		buffer.set(segmentBytes, initBuffer.length);
+		await drainSegmentPassthrough(buffer, cenc, options);
 	}
 }

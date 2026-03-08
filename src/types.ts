@@ -20,6 +20,16 @@ export interface StreamEntry {
 	headers?: Record<string, string>;
 	/** Force video codec type when init cannot be parsed; "hevc" uses hvcC default. */
 	videoCodec?: "avc" | "hevc";
+	/** Override framerate (e.g. 25, 30). When unset, uses value from manifest when available. */
+	framerate?: number;
+	/** Override bitrate in bps (e.g. 2_500_000). When unset, uses value from manifest when available. */
+	bitrate?: number;
+	/** Override output width in pixels. When unset, uses value from manifest or default. */
+	width?: number;
+	/** Override output height in pixels. When unset, uses value from manifest or default. */
+	height?: number;
+	/** When true, forward encoded video (and audio) without decode/encode. Lower CPU, no resize/codec change. */
+	passthrough?: boolean;
 }
 
 export interface RunnerContext {
@@ -63,6 +73,16 @@ export interface RunnerConfig {
 	isMuxedAudioOnly?: boolean;
 	/** Shared with video runner: transcode publishes embedded audio here when set. */
 	audioTrackRef?: MuxedAudioTrackRef;
+	/** Video framerate (e.g. 25, 30). From manifest or stream override. */
+	framerate?: number;
+	/** Video bitrate in bps. From manifest or stream override. */
+	bitrate?: number;
+	/** Video width in pixels for encode/scale. */
+	width?: number;
+	/** Video height in pixels for encode/scale. */
+	height?: number;
+	/** When true, forward encoded video without decode/encode (from stream.passthrough). */
+	passthrough?: boolean;
 }
 
 export interface Runner extends RunnerConfig {
@@ -88,8 +108,20 @@ export interface BoundedSeen {
 	add: (value: string) => void;
 }
 
+export interface M3u8VideoTrack {
+	url: string;
+	pollMs?: number;
+	/** From #EXT-X-STREAM-INF FRAME-RATE when present. */
+	framerate?: number;
+	/** From #EXT-X-STREAM-INF BANDWIDTH when present (bps). */
+	bitrate?: number;
+	/** From #EXT-X-STREAM-INF RESOLUTION when present (e.g. 1920x1080). */
+	width?: number;
+	height?: number;
+}
+
 export interface M3u8Master {
-	videoTracks: Array<{ url: string; pollMs?: number }>;
+	videoTracks: M3u8VideoTrack[];
 	audioTracks: Array<{ url: string; pollMs?: number }>;
 }
 
@@ -114,6 +146,14 @@ export interface DashTrackDescriptor {
 		endNumber?: number;
 	};
 	segmentUrls: string[];
+	/** From Representation @width when present. */
+	width?: number;
+	/** From Representation @height when present. */
+	height?: number;
+	/** From Representation @frameRate when present (e.g. 25 or 30000/1001). */
+	framerate?: number;
+	/** From Representation @bandwidth when present (bps). */
+	bandwidth?: number;
 }
 
 export interface DashSegmentTemplate {

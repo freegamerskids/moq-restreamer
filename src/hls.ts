@@ -8,15 +8,16 @@ import { decryptIfNeeded } from "./cenc.js";
 import { fetchBytes, fetchText } from "./fetch.js";
 import { AVC_CODEC_STRING, getDefaultAvcCDescription } from "./init-segment.js";
 import type {
+	M3u8Master,
+	M3u8VideoTrack,
 	MuxedAudioTrackRef,
 	ParsedM3u8Media,
 	RunnerConfig,
 	RunnerContext,
 	SegmentUrlBatch,
-	M3u8Master,
 	StreamKind,
 } from "./types.js";
-import { createBoundedSeen, parseAttributeLine, sanitizePlaylistUri } from "./util.js";
+import { createBoundedSeen, parseAttributeLine, parseFrameRate, parseResolution, sanitizePlaylistUri } from "./util.js";
 
 export function isHlsMasterPlaylist(text: string): boolean {
 	return text.includes("#EXT-X-STREAM-INF") || text.includes("#EXT-X-MEDIA");
@@ -51,7 +52,7 @@ export function parseM3u8Media(text: string, baseUrl: URL): ParsedM3u8Media {
 
 export function parseHlsMaster(text: string, baseUrl: URL): M3u8Master {
 	const lines = text.split(/\r?\n/).map((line) => line.trim());
-	const videoTracks: Array<{ url: string; pollMs?: number }> = [];
+	const videoTracks: M3u8Master["videoTracks"] = [];
 	const audioTracks = new Map<string, { url: string; pollMs?: number }>();
 
 	for (let i = 0; i < lines.length; i += 1) {
@@ -69,8 +70,14 @@ export function parseHlsMaster(text: string, baseUrl: URL): M3u8Master {
 				break;
 			}
 			if (nextUrl) {
+				const bandwidth = attrs.BANDWIDTH ? Number(attrs.BANDWIDTH) : undefined;
+				const res = parseResolution(attrs.RESOLUTION);
 				videoTracks.push({
 					url: new URL(nextUrl, baseUrl).toString(),
+					framerate: parseFrameRate(attrs["FRAME-RATE"]),
+					bitrate: Number.isFinite(bandwidth) ? bandwidth : undefined,
+					width: res?.width,
+					height: res?.height,
 				});
 			}
 			continue;
@@ -225,7 +232,8 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 		const nextSegmentUrls = async (): Promise<SegmentUrlBatch> => {
 			const current = await fetchText(context.stream.url, fetchOpts);
 			const p = parseM3u8Media(current, playlistUrl);
-			return readPlaylistSegmentUrls(p, state, playlistUrl);
+			const batch = await readPlaylistSegmentUrls(p, state, playlistUrl);
+			return batch;
 		};
 		configs.push({
 			streamName: context.stream.name,
@@ -238,25 +246,30 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			nextSegments,
 			nextSegmentUrls,
 			headers: context.stream.headers,
+			framerate: context.stream.framerate,
+			bitrate: context.stream.bitrate,
+			width: context.stream.width,
+			height: context.stream.height,
+			passthrough: context.stream.passthrough,
 		});
 		videoIndex = 1;
 	}
 
-	for (const trackUrl of master.videoTracks) {
+	for (const track of master.videoTracks) {
 		const name = `video/${videoIndex++}`;
 		const state = {
 			seen: createBoundedSeen(seenUrlLimit),
 			initEmitted: false,
 		};
-		const mediaBase = new URL(trackUrl.url);
-		const pollMs = Number(trackUrl.pollMs ?? defaultPollMs);
+		const mediaBase = new URL(track.url);
+		const pollMs = Number(track.pollMs ?? defaultPollMs);
 		const nextSegments = async () => {
-			const current = await fetchText(trackUrl.url, fetchOpts);
+			const current = await fetchText(track.url, fetchOpts);
 			const p = parseM3u8Media(current, mediaBase);
 			return readPlaylistSegments(context, p, state, mediaBase, "video");
 		};
 		const nextSegmentUrls = async (): Promise<SegmentUrlBatch> => {
-			const current = await fetchText(trackUrl.url, fetchOpts);
+			const current = await fetchText(track.url, fetchOpts);
 			const p = parseM3u8Media(current, mediaBase);
 			return readPlaylistSegmentUrls(p, state, mediaBase);
 		};
@@ -271,6 +284,11 @@ export async function buildHlsRunnerConfigs(context: RunnerContext): Promise<Run
 			nextSegments,
 			nextSegmentUrls,
 			headers: context.stream.headers,
+			framerate: context.stream.framerate ?? track.framerate,
+			bitrate: context.stream.bitrate ?? track.bitrate,
+			width: context.stream.width ?? track.width,
+			height: context.stream.height ?? track.height,
+			passthrough: context.stream.passthrough,
 		});
 	}
 

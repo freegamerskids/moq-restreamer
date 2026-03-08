@@ -11,7 +11,7 @@ import type {
 	RunnerContext,
 	StreamKind,
 } from "./types.js";
-import { createBoundedSeen, parseAttributeLine } from "./util.js";
+import { createBoundedSeen, parseAttributeLine, parseFrameRate } from "./util.js";
 
 function parseSegmentTemplate(xml: string): DashSegmentTemplate | null {
 	const match =
@@ -115,6 +115,17 @@ export function parseDashManifest(
 			const trackName = `${kind}/${trackIndex}`;
 			const id = `${streamName}::${kind}::${representationId}::${trackIndex}`;
 
+			const width = representationAttr.width ? Number(representationAttr.width) : undefined;
+			const height = representationAttr.height ? Number(representationAttr.height) : undefined;
+			const framerate = parseFrameRate(representationAttr.frameRate);
+			const bandwidth = representationAttr.bandwidth ? Number(representationAttr.bandwidth) : undefined;
+			const dashMedia = {
+				...(Number.isFinite(width) && { width: width! }),
+				...(Number.isFinite(height) && { height: height! }),
+				...(framerate !== undefined && { framerate }),
+				...(Number.isFinite(bandwidth) && { bandwidth: bandwidth! }),
+			};
+
 			if (template?.media) {
 				const media = template.media;
 				descriptors.push({
@@ -132,6 +143,7 @@ export function parseDashManifest(
 						endNumber: template.endNumber ? Number(template.endNumber) : undefined,
 					},
 					segmentUrls: [],
+					...dashMedia,
 				});
 				representationIndex += 1;
 				continue;
@@ -158,6 +170,7 @@ export function parseDashManifest(
 					startNumber: 1,
 				},
 				segmentUrls: fullSegments,
+				...dashMedia,
 			});
 			representationIndex += 1;
 		}
@@ -190,6 +203,11 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 				...(desc.kind === "video" && {
 					codec: AVC_CODEC_STRING,
 					codecDescription: getDefaultAvcCDescription(),
+					framerate: context.stream.framerate ?? desc.framerate,
+					bitrate: context.stream.bitrate ?? desc.bandwidth,
+					width: context.stream.width ?? desc.width,
+					height: context.stream.height ?? desc.height,
+					passthrough: context.stream.passthrough,
 				}),
 				nextSegments: async () => {
 					const chunks: Uint8Array[] = [];
@@ -276,6 +294,11 @@ export async function buildDashRunnerConfigs(context: RunnerContext): Promise<Ru
 			...(desc.kind === "video" && {
 				codec: AVC_CODEC_STRING,
 				codecDescription: getDefaultAvcCDescription(),
+				framerate: context.stream.framerate ?? desc.framerate,
+				bitrate: context.stream.bitrate ?? desc.bandwidth,
+				width: context.stream.width ?? desc.width,
+				height: context.stream.height ?? desc.height,
+				passthrough: context.stream.passthrough,
 			}),
 			nextSegments: async () => {
 				const currentText = await fetchText(desc.manifestUrl, fetchOpts);
